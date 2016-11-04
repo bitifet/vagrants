@@ -33,7 +33,7 @@ echo Update package list again...
 
 log Install postgres cluster:
 #############################
-2>&1 sudo apt-get -y install postgresql-9.6 postgresql-contrib-9.6 htop iotop pg_access
+2>&1 sudo apt-get -y install postgresql-9.6 postgresql-contrib-9.6 htop iotop pg-activity
 
 
 
