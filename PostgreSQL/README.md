@@ -3,6 +3,13 @@ PostgreSQL Vagrant Environment
 
 PostgreSQL server environment.
 
+  * OS: Ubuntu 16.04 LTS
+  * PostgreSQL version: 9.6
+  * Data storage: Additional LVM Disk.
+    - Virtual size: 100GB.
+    - Starting volume size: 20GB.
+    - Starting real HD usage (vdi size): about 60MB.
+
 
 Vagrant environment:
 --------------------

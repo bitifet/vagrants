@@ -1,1 +1,21 @@
+# Vagrant related:
+**/.vagrant
+
+# VDI Virtualbox disk images:
+**/*.vdi
+
+# Vim cache files:
 **/*.sw*
+
+# Log files:
+**/*.log
+
+# Compressed files (backups, etc...)
+**/*.tar
+**/*.tar.gz
+**/*.tgz
+**/*.tar.bz
+**/*.tar.bz2
+**/*.tbz
+**/*.tar.xz
+**/*.txz

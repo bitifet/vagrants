@@ -20,11 +20,12 @@ Vagrant.configure(2) do |config|
 
   config.vm.provider "virtualbox" do |vb|
     if ! File.file?('database_disk.vdi') then
-      vb.customize ['createhd', '--filename', 'database_disk', '--size', 40960]
+      vb.customize ['createhd', '--filename', 'database_disk', '--size', 102400]
     end
     vb.customize ['storageattach', :id, '--storagectl', 'SCSI Controller', '--port', 2, '--device', 0, '--type', 'hdd', '--medium', 'database_disk.vdi'] 
   end
   config.vm.provision "shell", path: "provision.sh"
+  #config.vm.network "public_network", use_dhcp_assigned_default_route: true
 
   
   # The most common configuration options are documented and commented below.
