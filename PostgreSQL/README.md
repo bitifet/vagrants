@@ -25,4 +25,5 @@ Regular scripts:
 
   * setup.sh       - Upgrade to PostgreSQL 9.6
   * hotStandby.sh  - Configure as Hot-Standby of another server.
+  * pgclone.sh     - Allow to instant-clone PostgreSQL clusters on btrfs filesystems.
   
