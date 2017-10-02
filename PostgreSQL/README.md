@@ -58,13 +58,30 @@ Helps to easily manage multiple HotStandby clusters in the same server.
 
   * Multiple PostgreSQL versions can be handled in the same server:
 
+  * Automatically configures hot-standby cluster:
+
+    - Uses default configuration files (created by pg_createcluster command).
+    - Perform required modifications to put it in hot-standby mode.
+    - Fetch and merge-in master configuration files so some special parameters
+      (specially memory-related ones) are automatically imported. 
+    - Other differnces (specially pg_hba.conf accesses) require manual review
+      so you can decide to respect them (for example to allow same accesses in
+      case of failover) or restrict some (like replication user itself) or all
+      of them.
+    - **IMPORTANT:** This requires
+      [humandiff](https://www.npmjs.com/package/humandiff) to easily merge
+      master and default hot-standby configuration files (postgresql.conf and
+      hba.conf).
+
 
 #### Setup
 
   1. Place multiStandby.sh script somwhere (preferrable under directory present
 in $PATH.
 
-  2. Install all PostgreSQL-server versions you need to hold (most of relatively recent versions will be available as .deb packages on ubuntu/debian disros). Example:
+  2. Install [humandiff](https://www.npmjs.com/package/humandiff) (you need nodeJS and npm already installed): `sudo npm install -g humandiff`
+
+  3. Install all PostgreSQL-server versions you need to hold (most of relatively recent versions will be available as .deb packages on ubuntu/debian disros). Example:
 
 
     $ sudo apt-get install postgresql-9.6 \
@@ -72,7 +89,7 @@ in $PATH.
                            postgresql-9.4 \
                            postgresql-9.3
 
-  3. Remove clusters created by default (except if you plan to use it as regular databases). Example:
+  4. Remove clusters created by default (except if you plan to use it as regular databases). Example:
 
 
     $ sudo pg_dropcluster 9.6 main
@@ -84,28 +101,28 @@ in $PATH.
 #### Usage
 
 
-	USAGE: multiStandby.sh <command> [args...]
+    USAGE: multiStandby.sh <command> [args...]
 
-		Available commands are:
+        Available commands are:
 
-			* help - Show this help message.
-			* list - List existing clusters.
-			* add  - Create new standby cluster of specified master.
-			* drop - Remove existing (standby) cluster.
+            * help - Show this help message.
+            * list - List existing clusters.
+            * add  - Create new standby cluster of specified master.
+            * drop - Remove existing (standby) cluster.
 
-		Type multiStandby.sh help <command> for detailed command usage help.
+        Type multiStandby.sh help <command> for detailed command usage help.
 
 
 #### Example:
 
-	ubuntu@multiStandbyServer:~$ sudo ./multiStandby.sh list
-	=== ===================================================== ===
-	=== PostgresSQL as SUPER-Hot-Standby configuration script ===
-	=== ===================================================== ===
-	Ver Cluster                Port Status
-	9.6 alfrescoServer         6001 online,recovery
-	9.5 daedalus.example.com   6002 online,recovery
-	9.6 someServer             6000 online,recovery
+    ubuntu@multiStandbyServer:~$ sudo ./multiStandby.sh list
+    === ===================================================== ===
+    === PostgresSQL as SUPER-Hot-Standby configuration script ===
+    === ===================================================== ===
+    Ver Cluster                Port Status
+    9.6 alfrescoServer         6001 online,recovery
+    9.5 daedalus.example.com   6002 online,recovery
+    9.6 someServer             6000 online,recovery
 
 
 
