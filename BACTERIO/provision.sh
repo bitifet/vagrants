@@ -6,7 +6,7 @@ echo "Actualitzant tot el sistema..."
 sudo apt-get -y dist-upgrade
 
 echo "Instal·lant build-essential..."
-sudo apt-get install -y buid-essential
+sudo apt-get install -y build-essential
 
 echo "Instal·lant Node.JS..."
 sudo apt-get install -y nodejs-legacy
