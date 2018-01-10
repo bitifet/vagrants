@@ -22,4 +22,4 @@ echo Trigger mount:
 2>&1 sudo mount -a
 
 
-/vagrant/setup.sh
+/vagrant/setup.sh --vagrant

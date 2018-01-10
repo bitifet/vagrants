@@ -16,7 +16,7 @@ Vagrant environment:
 --------------------
 
   * Vagrantfile    - Defines Ubuntu 16.04 LTS with additional 40GB Disk
-  * provision.sh   - Vagrant provisioning script (also executes setup.sh).
+  * provision.sh   - Vagrant provisioning script (also executes `setup.sh --vagrant`).
 
 
 <a name="scripts"></a>
