@@ -2,7 +2,7 @@
 
 # Redirect stderr to stdout when used as vagrant provisioning script:
 if [[ "${1}" == "--vagrant" ]]; then
-    2>&1 "${0} --upgrade";
+    2>&1 "${0}" --upgrade;
     exit $?;
 fi;
 
