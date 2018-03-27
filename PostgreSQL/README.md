@@ -38,8 +38,8 @@ Upgrade to PostgreSQL 9.6
 Configure as Hot-Standby of another server.
 
 
-<a name="multiStandby"></a>
-### `multiStandby.sh`
+<a name="pgstandby"></a>
+### `pgstandby`
 
 Helps to easily manage multiple HotStandby clusters in the same server.
 
@@ -73,56 +73,93 @@ Helps to easily manage multiple HotStandby clusters in the same server.
       master and default hot-standby configuration files (postgresql.conf and
       hba.conf).
 
+**WARNING:** This documentation is not fully updated. See own script help info
+for more accurated documentation.
 
 #### Setup
 
-  1. Place multiStandby.sh script somwhere (preferrable under directory present
-in $PATH.
+  1. Place pgstandby script somwhere, preferrable under directory present
+in $PATH (/usr/local/bin for example).
 
-  2. Install [humandiff](https://www.npmjs.com/package/humandiff) (you need nodeJS and npm already installed): `sudo npm install -g humandiff`
+  2. Edit it and customize 'Global parameters' secion (if needed).
 
-  3. Install all PostgreSQL-server versions you need to hold (most of relatively recent versions will be available as .deb packages on ubuntu/debian disros). Example:
+  3. Install [humandiff](https://www.npmjs.com/package/humandiff) (you need
+     nodeJS and npm already installed): `sudo npm install -g humandiff`
+
+  4. Install all PostgreSQL-server versions you need to hold (most of
+     relatively recent versions will be available as .deb packages on
+     ubuntu/debian disros). Example:
 
 
     $ sudo apt-get install postgresql-9.6 \
                            postgresql-9.5 \
-                           postgresql-9.4 \
-                           postgresql-9.3
+                           postgresql-9.4
 
-  4. Remove clusters created by default (except if you plan to use it as regular databases). Example:
+  4. Remove clusters created by default (except if you plan to use it as
+     regular databases). Example:
 
 
     $ sudo pg_dropcluster 9.6 main
     $ sudo pg_dropcluster 9.5 main
     $ sudo pg_dropcluster 9.4 main
-    $ sudo pg_dropcluster 9.3 main
 
 
 #### Usage
 
 
-    USAGE: multiStandby.sh <command> [args...]
 
-        Available commands are:
+    $ pgstandby help
+    === ===================================================== ===
+    === PostgresSQL as SUPER-Hot-Standby configuration script ===
+    === ===================================================== ===
 
-            * help - Show this help message.
-            * list - List existing clusters.
-            * add  - Create new standby cluster of specified master.
-            * drop - Remove existing (standby) cluster.
+    SYNOPSIS
+        pgstandby [modifiers] <command> [args...]
 
-        Type multiStandby.sh help <command> for detailed command usage help.
+    MODIFIERS
+        --silent Supress normal output unless warning or error is triggered.
+        --log    Save output to log file (even in silent mode).
+
+    COMMANDS
+        help    - Show this help message.
+        list    - List existing clusters.
+        check   - Check standby clusters status.
+        add     - Create new standby cluster of specified master.
+        drop    - Remove existing (standby) cluster.
+        clone   - Create (writable) copy of (master or standby) cluster.
+        viconf  - postgresql.conf edit helper.
+        vihba   - hba.conf edit helper.
+        start   - Cluster start helper.
+        stop    - Cluster reload helper.
+        reload  - Cluster reload helper.
+        restart - Cluster restart helper.
+        log     - Cluster log inspection helper.
+        backup  - Backup tool.
+        stream  - wal/xlog streaming service
+
+    NOT YET IMPLEMENTED...
+        restore - PITR Restore backup tool.
+
+    HINT
+        Type 'pgstandby help <command>' for detailed command usage help.
+
 
 
 #### Example:
 
-    ubuntu@multiStandbyServer:~$ sudo ./multiStandby.sh list
+
+    $ pgstandby list
+    This script must be run as root...
+    [sudo] password for myUser:
     === ===================================================== ===
     === PostgresSQL as SUPER-Hot-Standby configuration script ===
     === ===================================================== ===
-    Ver Cluster                Port Status
-    9.6 alfrescoServer         6001 online,recovery
-    9.5 daedalus.example.com   6002 online,recovery
-    9.6 someServer             6000 online,recovery
+    Ver Cluster                 Port Status           Standby  Backup
+    -----------------------------------------------------------------
+    9.4 server1.example.com     6001 online,recovery  conErr   ONLINE
+    9.4 server2.example.com     6002 offline,recovery OFFLINE  conErr
+    9.6 server3.example.com     6007 online,recovery  ONLINE   ONLINE
+    TOTAL:  3
 
 
 

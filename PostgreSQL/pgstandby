@@ -1,0 +1,2685 @@
+#!/usr/bin/env bash
+
+# Global parameters__________________________________
+
+readonly STANDBY_BASE_PORT=6000; # Should be x000
+readonly REGULAR_BASE_PORT=5432;
+readonly REPLICATION_USER='replication';
+
+readonly pg_basePath="/var/lib/postgresql"
+readonly pg_libPath="/usr/lib/postgresql"
+readonly pg_logPath="/var/log/postgresql"
+readonly pg_configPath="/etc/postgresql"
+readonly pg_backupPath="/var/lib/postgresql_backup"
+readonly pg_backupLogFile="${pg_logPath}/postgresql-standby.log"
+readonly pg_recoveryConfFile="recovery.conf"
+readonly pg_recoveryDoneFile="recovery.done"
+readonly pg_recoveryFailedFile="recovery.failed"
+readonly hostname=$(hostname);
+readonly replica_slotName="${hostname,,}_replica"; # (LowerCase)
+readonly backup_slotName="${hostname,,}_backup"; # (LowerCase)
+readonly cmd_compression="lbzip2"
+readonly cmd_decompression="lbunzip2"
+readonly ext_compression="bz2"
+readonly tempPath="${pg_basePath}/TEMP";
+readonly minClusterFreeSpace=10G;
+
+# ___________________________________________________
+
+# Environment
+LANG=C            # Prefer english error messages.
+set -o pipefail   # Preserve non-zero exit status on pipes.
+
+# Arguments:
+cmd0="${0}"
+args0=$@
+
+# Miscelleneous constants:
+readonly DEBUG_ARGS=""
+readonly DEBUG_PRMS=""
+readonly errorStatus=2;
+readonly warningStatus=1;
+readonly okStatus=0;
+if [ -t 1 ]; then
+    readonly B="$(tput bold)"; # Bold
+    readonly b="$(tput sgr0)"; # unBold
+    readonly isTerminal=true;
+else
+    readonly B="";
+    readonly b="";
+    readonly isTerminal=false;
+fi;
+
+# Variables:
+exitStatus=$okStatus;
+
+
+# References:
+# ===========
+# Replication Slots:
+#   - https://medium.com/@tk512/replication-slots-in-postgresql-b4b03d277c75
+
+
+# Global modifiers:#{{{
+# =================
+
+# Log mode (--log) #{{{
+# -----------------
+# Log even on silent mode:
+if [ "${1}" = "--log" -a "${2}" = "--silent" ]; then
+    shift 2;
+    "${0}" --silent --log ${@};
+    exitStatus=$?
+    exit $exitStatus;
+fi;
+if [ "${1}" = "--log" ]; then
+    shift; # Consume "--log" argument.
+
+
+    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" >> "${pg_backupLogFile}"
+    echo "~ $(date +"%Y-%m-%d %H:%M:%S %Z") - STARTING - $(basename ${0}) ${@} ~" >> "${pg_backupLogFile}"
+    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" >> "${pg_backupLogFile}"
+
+    # Silently recall
+    "${0}" ${@} | tee -a "${pg_backupLogFile}";
+    exitStatus=$?
+
+    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" >> "${pg_backupLogFile}"
+    echo "~ $(date +"%Y-%m-%d %H:%M:%S %Z") - FINISHED - $(basename ${0}) ${@} - EXIT STATUS: ${exitStatus} ~" >> "${pg_backupLogFile}"
+    echo "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~" >> "${pg_backupLogFile}"
+
+    exit $exitStatus;
+fi;
+# -----------------#}}}
+
+# Silent mode (--silent)#{{{
+# ----------------------
+if [ "${1}" = "--silent" ]; then
+
+    shift; # Consume "--silent" argument.
+
+    # Pick temporary path:
+    tpath="${TMP}";
+    if [ -z "${tpath}" -o ! -d "${tpath}" ]; then
+        tpath="/tmp"
+    fi;
+
+    # Create temporary file:
+    tmpfile=$(mktemp ${tpath}/tmpfile.XXXXXX);
+
+    # Open descriptor:
+    exec 3>"$tmpfile"
+
+    # Remove hard link (ensure deletion after execution):
+    rm "$tmpfile"
+
+
+    # Silently recall
+    "${0}" ${@} > /proc/$$/fd/3
+    exitStatus=$?
+
+    # Render output ONLY if non-zero exit status:
+    if [ "${exitStatus}" -gt 0 ]; then
+        cat /proc/$$/fd/3;
+    fi;
+
+    exit $exitStatus;
+
+fi;
+# ----------------------#}}}
+
+# =================#}}}
+
+
+# Documentation:#{{{
+# ==============
+
+# function help() - Display help message. 
+function help() {
+local self=$(basename "$0")
+local helpCmd=${1};
+
+banner;
+
+case "${helpCmd}" in
+
+list)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} [mode] [pg_version [, cluster_name]]
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    List existing REPLICATION clusters. 
+
+${B}ARGUMENTS${b}
+    mode         - Operation mode (see OPERATION MODES)
+    pg_version   - List only clusters of given PostgreSQL version.
+    cluster_name - Display specified cluster information only.
+
+${B}OPERATION MODES${b}
+    "standby"    - ${B}(Default)${b} List standby clusters and its statuses.
+    "legacy"     - Become simple wrapper to 'pg_lsclusters' command.
+
+${B}COLUMNS${b} (default operation mode)
+    Ver          - PostgreSQL version of the cluster.
+    Cluster      - Name of the cluster (Master's FQDN).
+    Port         - Assigned port (standby replica).
+    Status       - Current cluster status (see CLUSTER STATUSES).
+    Standby      - Standby replication slot status (see SLOT STATUSES).
+    Backup       - Backup replication slot status (see SLOT STATUSES).
+
+${B}CLUSTER STATUSES${b}
+    "online"     - Cluster is online.
+    "offline"    - Cluster is ofline.
+    ",recovery"  - Cluster is in replication.
+    ",FAILOVER"  - Cluster is failovered.
+
+${B}SLOT STATUSES${b}
+    "UNUSED"     - Slot have not been yet used.
+    "OFFLINE"    - Slot is not currenly used (waiting state).
+    "ONLINE"     - Slot is currently in use.
+    "conErr"     - Slot status cannot be retrieved (check pg_bha.conf).
+    "-NONE-"     - Slot does not exist (check max_replication_slots).
+    "!DEAD!"     - Master's slot is waiting while stansby failovered.
+    "pwErr"      - Replication user password is unknown (should not happen).
+
+!EOF
+;;#}}}
+
+add)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version master_host [master_port]
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Assist to create new standby of specified host.
+
+${B}ARGUMENTS${b}
+    pg_version  - Cluster Version.
+    master_host - FQDN of the master host.
+        (will be used as cluster name).
+    master_port - Port of the master cluster (default 5432)
+
+!EOF
+;;#}}}
+
+drop)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version cluster_name
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Remove existing cluster.
+
+${B}ARGUMENTS${b}
+    pg_version   - Cluster Version.
+    cluster_name - Name of the cluster to be dropped.
+
+!EOF
+;;#}}}
+
+log)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version cluster_name
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Inspect cluster log file.
+
+${B}ARGUMENTS${b}
+    pg_version   - Cluster Version.
+    cluster_name - Name of the cluster to be dropped.
+
+!EOF
+;;#}}}
+
+clone)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version [newCluster_name] [newCluster_port] [target_host] [target_port]
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Clone database cluster from target (master or replica) and put it online.
+
+    (Useful to create testing environments)
+
+${B}ARGUMENTS${b}
+    pg_version      - Cluster Version
+    newCluster_name - Destination Cluster name (default "main")
+    newCluster_port - Destination Cluster port (default 5432)
+    target_host     - Host of the cluster to be cloned (Optional)
+        - If ommitted, local unix socket and postgresql (peer) user will be
+          used.
+        - ${REPLICATION_USER} password will be queried otherwise.
+    target_port     - Target Cluster port (default 5432)
+
+!EOF
+;;#}}}
+
+failover)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version master_host [master_port]
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Promote (perform failover) over existing replica.
+      * Promote cluster.
+      * Remove replication slot in master (IMPORTANT).
+
+    ${B}DESCRIPTION:${b} This is a non reversible operation.
+        For testing purposes consider:
+            * Using "clone" instead (consumes disk space).
+            * Taking LVM snapshot before (only if you know what you are doing).
+              - You shall recover cluster manually because restoring whole
+                snapshot will break other replicas..
+
+${B}ARGUMENTS${b}
+    pg_version  - Cluster Version.
+    master_host - FQDN of the master host.
+    master_port - Port of the master cluster (default 5432)
+        (this is only needed to remove replication slot).
+
+!EOF
+;;#}}}
+
+viconf)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version master_host
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Simple helper to edit postgresql.conf file.
+
+${B}ARGUMENTS${b}
+    pg_version  - Cluster Version.
+    master_host - FQDN of the master host.
+
+!EOF
+;;#}}}
+
+vihba)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version master_host
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Simple helper to edit pg_hba.conf file.
+
+${B}ARGUMENTS${b}
+    pg_version  - Cluster Version.
+    master_host - FQDN of the master host.
+
+!EOF
+;;#}}}
+
+start)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version master_host
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Simple helper to start specific standby cluster.
+
+${B}ARGUMENTS${b}
+    pg_version  - Cluster Version.
+    master_host - FQDN of the master host.
+
+!EOF
+;;#}}}
+
+stop)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version master_host
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Simple helper to stop specific standby cluster.
+
+${B}ARGUMENTS${b}
+    pg_version  - Cluster Version.
+    master_host - FQDN of the master host.
+
+!EOF
+;;#}}}
+
+reload)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version master_host
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Simple helper to reload specific standby cluster configuration.
+
+${B}ARGUMENTS${b}
+    pg_version  - Cluster Version.
+    master_host - FQDN of the master host.
+
+!EOF
+;;#}}}
+
+restart)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version master_host
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Simple helper to restart specific standby cluster.
+
+${B}ARGUMENTS${b}
+    pg_version  - Cluster Version.
+    master_host - FQDN of the master host.
+
+!EOF
+;;#}}}
+
+backup)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} [pg_version [master_host]]
+    ${self} [modifiers] ${helpCmd} config
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Perform base backup for all replication clusters.
+
+    If pg_version and/or master_host are specified, then only perform
+    basebackup for matching replicas. Else all replication clusters are
+    backed-up.
+
+    If "config" keyword specified instead, makes a configuration files backup
+    instead.
+
+${B}ARGUMENTS${b}
+    pg_version  - Cluster Version.
+    master_host - FQDN of the master host.
+
+!EOF
+;;#}}}
+
+stream)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} [operation]
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Starts, stops or checks backup streaming replication process for ALL
+    standby clusters
+
+${B}ARGUMENTS${b}
+    operation  - "start" / "stop" / "check" (default="check")
+
+${B}EXIT STATUS${b}
+    0: Ok.
+    1: Warning (some suspecting circumstance detected)
+    2: Error (one or more operations failed.
+
+!EOF
+;;#}}}
+
+check)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} [operation]
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Check standby clusters status
+
+${B}EXIT STATUS${b}
+    0: Ok.
+    1: Warning (some suspecting circumstance detected)
+    2: Error (one or more operations failed.
+
+!EOF
+;;#}}}
+
+restore)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} pg_version master_host
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    UNDOCUMENTED!!!
+
+${B}ARGUMENTS${b}
+    pg_version  - Cluster Version.
+    master_host - FQDN of the master host.
+
+!EOF
+;;#}}}
+
+help)#{{{
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] ${helpCmd} [ command ]
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}DESCRIPTION${b}
+    Shows usage details for given command or general usage help if unspecified.
+
+!EOF
+;;#}}}
+
+*)
+cat <<!EOF
+
+${B}SYNOPSIS${b}
+    ${self} [modifiers] <command> [args...]
+
+${B}MODIFIERS${b}
+    --silent Supress normal output unless warning or error is triggered.
+    --log    Save output to log file (even in silent mode).
+
+${B}COMMANDS${b}
+    help    - Show this help message.
+    list    - List existing clusters.
+    check   - Check standby clusters status.
+    add     - Create new standby cluster of specified master.
+    drop    - Remove existing (standby) cluster.
+    clone   - Create (writable) copy of (master or standby) cluster.
+    viconf  - postgresql.conf edit helper.
+    vihba   - hba.conf edit helper.
+    start   - Cluster start helper.
+    stop    - Cluster reload helper.
+    reload  - Cluster reload helper.
+    restart - Cluster restart helper.
+    log     - Cluster log inspection helper.
+    backup  - Backup tool.
+    stream  - wal/xlog streaming service
+
+${B}NOT YET IMPLEMENTED...${b}
+    restore - PITR Restore backup tool.
+
+${B}HINT${b}
+    Type '${self} help <command>' for detailed command usage help.
+
+!EOF
+;;
+
+esac;
+
+}
+
+
+# ==============#}}}
+
+
+# Helper functions:#{{{
+# =================
+
+# function indent(cmd [args...]) # Simple indentation helper.#{{{
+function indent() {
+
+    if [ "${isTerminal}" = true ]; then
+
+        # Connect original stdout to d3
+        exec 3<&1
+
+        # Redirect stdout to indenter:
+        exec 1> >(sed "s/^/    /")
+
+        # Execute given command:
+        $@;
+
+        # Reconnect original stdout to d1
+        exec 1<&3
+
+        # Wait for d3 to be consumed (echoed).
+        sleep 1;
+        # FIXME: How the hell could we effectively wait for descriptor to be flushed.
+
+    else
+        $@;
+    fi;
+}
+#}}}
+
+# function paint(colorName) # Simple colorizer helper #{{{
+function paint() {
+
+    if [ "${isTerminal}" = true ]; then
+
+        # Colors ( https://misc.flogisoft.com/bash/tip_colors_and_formatting )#{{{
+        local color_default=39
+        local color_black=30
+        local color_red=31
+        local color_green=32
+        local color_yellow=33
+        local color_blue=34
+        local color_magenta=35
+        local color_cyan=36
+        local color_lightgray=37
+        local color_darkgray=90
+        local color_lightred=91
+        local color_lightgreen=92
+        local color_lightyellow=93
+        local color_lightblue=94
+        local color_lightmagenta=95
+        local color_lightcyan=96
+        local color_white=97
+        #}}}
+        local colorName=$1
+        eval local colorCode="\${color_${colorName}}"
+        [ -n "${colorCode}" ] || colorCode=${color_default};
+
+        perl -pe "s/^/\\e[${colorCode}m/"
+        echo -en "\e[39m"
+
+    else
+        cat
+    fi;
+}
+#}}}
+
+# function pg_babel(keyword) - Version compatibility helper#{{{
+function pg_babel(){
+
+    local keyword="${1}";
+    checkArg pgVersion "pg_version" soft;
+
+    local major=$(echo "${pg_version}" | perl -pe 's/\..*//')
+
+    # References: https://wiki.postgresql.org/wiki/New_in_postgres_10#Renaming_of_.22xlog.22_to_.22wal.22_Globally_.28and_location.2Flsn.29
+
+    case "${keyword}" in
+        "pg_receivewal") # pg_receivexlog has been renamed to pg_receivewal.
+            # PostgreSQL 9.4 pg_receivexlog command hasn't --create-slot option.
+            # So use nearest available higher version.
+            if [[ "${pg_version}" = "9.4" ]]; then
+                local bestVersion=$(ls /usr/lib/postgresql | grep -Ev '^9.(1|2|3|4)$' | sort -V | head -n 1)
+            else
+                local bestVersion="${pg_version}";
+            fi;
+
+            # Manual selection because pg_wrapper not always guess it right.
+            keyword="${pg_libPath}/${bestVersion}/bin/pg_receivewal"
+            [[ "${major}" -ge 10 ]] || keyword="${pg_libPath}/${bestVersion}/bin/pg_receivexlog"
+        ;;
+        "pg_resetwal") # pg_resetxlog has been renamed to pg_resetwal.
+            # Manual selection because pg_wrapper not always guess it right.
+            keyword="${pg_libPath}/${pg_version}/bin/pg_resetwal"
+            [[ "${major}" -ge 10 ]] || keyword="${pg_libPath}/${pg_version}/bin/pg_resetxlog"
+        ;;
+        "pg_waldump") # pg_xlogdump has been renamed to pg_waldump.
+            [[ "${major}" -ge 10 ]] || keyword="pg_xlogdump";
+        ;;
+        "--waldir") # initdb and pg_basebackup have a --waldir option rather than --xlogdir.
+            [[ "${major}" -ge 10 ]] || keyword="--xlogdir";
+        ;;
+        "--wal-method") # pg_basebackup now has --wal-method rather than --xlog-method.
+            [[ "${major}" -ge 10 ]] || keyword="--xlog-method";
+        ;;
+        *)
+            if [[ "${keyword:0:2}" != "--" ]]; then
+                # Manual selection because pg_wrapper not always guess it right.
+                keyword="${pg_libPath}/${pg_version}/bin/${keyword}"
+            fi;
+        ;;
+    esac;
+
+    # Return same keyword unless it needs to be changed.
+    echo "${keyword}";
+
+}
+#}}}
+
+# function banner()#{{{
+function banner() {
+echo "=== ===================================================== ==="
+echo "=== PostgresSQL as SUPER-Hot-Standby configuration script ==="
+echo "=== ===================================================== ==="
+}
+#}}}
+
+#function raiseStatus() - Simple status raising helper#{{{
+function raiseStatus(){
+    local level="${1}";
+    [ "${level}" -le "${exitStatus}" ] || exitStatus="${level}";
+}
+#}}}
+
+# function usageeror() - Generate usage error. #{{{
+function usageerror() {
+    >&2 echo "${B}SYNTAX ERROR:${b} ${1}";
+    >&2 help "${cmd}";
+    raiseStatus $errorStatus;
+    exit $exitStatus;
+}
+#}}}
+
+# function runtimeerror() - Generate runtime error. #{{{
+function runtimeerror() {
+    if [ "${1}" = "--noexit" ]; then
+        local noexit=true;
+        shift;
+    else
+        local noexit=false;
+    fi;
+    local message="${1}";
+    local flagFile="${2}";
+    if [[ -n "${flagFile}" ]]; then
+        echo "ERROR: ${message}" >> "${flagFile}";
+    fi;
+    echo -n "${B}ERROR:${b} " | paint red;
+    echo "${message}";
+    raiseStatus $errorStatus;
+    if [ "${noexit}" != true ]; then
+        exit $exitStatus;
+    fi;
+}
+#}}}
+
+# function runtimewarning() - Generate runtime warning. #{{{
+function runtimewarning() {
+    if [ "${1}" = "--nostatus" ]; then
+        shift; # (consume)
+    else
+        raiseStatus $warningStatus;
+    fi;
+    echo -n "${B}WARNING:${b} " | paint yellow;
+    echo " ${1}";
+}
+#}}}
+
+# function labelmessage() - Generate runtime warning. #{{{
+function labelmessage() {
+    local color=${1};
+    local label=${2};
+    local message=${3};
+    echo -n "${B}${label}:${b} " | paint "${color}";
+    echo " ${message}";
+}
+#}}}
+
+# function displayMessage()#{{{
+function displayMessage() {
+    local msg="${1}";
+    echo "";
+    echo "-----------------------------------------------------------";
+    echo "";
+    echo "${B}${msg}"${b}
+    echo "";
+    echo "-----------------------------------------------------------";
+    echo "";
+}
+#}}}
+
+# function askConfirm()#{{{
+function askConfirm() {
+    local msg="${1}";
+    displayMessage "${msg}";
+    read -p "Are you FULLY sure ${B}(Yes/No)${b}? " answer;
+    while [ "${answer,,}" != yes -a "${answer,,}" != no ]; do
+        if [[ "${answer,,}" != "yes" ]]; then
+            read -p "Please answer with '${B}yes'${b} or ${B}'no'${b}: " answer;
+        fi;
+    done;
+    if [[ "${answer,,}" != "yes" ]]; then
+        raiseStatus $warningStatus;
+        exit $exitStatus;
+    fi;
+}
+#}}}
+
+# function checkRoot() - Check root identity. #{{{
+function checkRoot() {
+    # Make sure only root can run our script
+    if [ "$(id -u)" != "0" ]; then
+        echo "${B}This script must be run as root...${b}"
+        sudo "${cmd0}" ${args0};
+        raiseStatus $?;
+        exit $exitStatus;
+    fi
+}
+#}}}
+
+# function checkArg() - Arguments validation helper#{{{
+function checkArg() {
+    local argType="${1}"; shift;
+    local argName="${1}"; shift;
+    # Optional modifiers: $1, $2...
+    if [ -n "${argName}" ]; then # Let no argument at all for common checkings
+        eval local argValue="\${${argName}}"
+    fi;
+
+    if [[ -n "${DEBUG_ARGS}" ]]; then
+        echo "  * ${argName}::${argType}  -> \"${argValue}\"";
+    fi;
+
+    case "${argType}" in
+        pgVersion)# (Improvable) Check of version parameter. {{{
+            echo "${argValue}" | perl -ne '/^\d+?\.?\d+$/ || exit 1' \
+                || usageerror "Invalid version number: ${argValue}" \
+            ;
+            if [[ "${1}" != "soft" ]]; then
+                perl -e "${argValue} >= 9.0 || exit 1" \
+                    || runtimeerror "Postgres versions under 9.0 doesn't support streaming replication." \
+                ;
+            fi;
+            if [[ "${1}" != "soft" ]]; then
+                perl -e "${argValue} >= 9.4 || exit 1" \
+                    || runtimeerror "Postgres versions under 9.4 doesn't support replication slots." \
+                ;
+            fi;
+        ;;#}}}
+        fqdnhost)# (Improvable) Check of (remote) host name. {{{
+            if ! [[ "${argValue}" =~ ^([[:alnum:]]+\.)+[[:alnum:]]+$ ]] ; then
+                usageerror "Invalid host name: ${argValue} (must be FQDN)";
+            fi;
+        ;;#}}}
+        clusterName)#{{{
+            if [[ -z "${argValue}" ]] ; then
+                usageerror "Invalid host name: ${argValue}";
+            fi;
+        ;;#}}}
+        pgPort)# (Improvable) Check of (remote) port number. {{{
+            local re='^[0-9]+$'
+            if ! [[ "${argValue}" =~ $re ]] ; then
+                usageerror "Invalid port number: ${argValue}";
+            fi;
+        ;;#}}}
+        dirExists)#{{{
+            # Check bakup path already exists:
+            local label="${1}"; shift;
+            if [ ! -d "${pg_backupPath}" ]; then
+                runtimeerror "${label} path (${pg_backupPath}) does not exist!!";
+            fi;
+        ;;#}}}
+        *)#{{{
+            runtimeerror "Unknown argument type checking: ${argType} for value ${argValue}";
+        ;;#}}}
+    esac;
+}
+#}}}
+
+# function checkFreeSpace(path minSize)#{{{
+function checkFreeSpace() {
+    local path="${1}";
+    local minSize="${2}";
+    local units=$(echo "${minSize}" | perl -pe 's/\d+//g');
+    local number=$(echo "${minSize}" | perl -pe 's/\D+//g');
+
+    local value=$( \
+        df "${path}" -B "${units}" \
+        | tail -n 1 \
+        | awk '{print $4}' \
+        | perl -pe 's/\D+//g' \
+    );
+
+    if [ "${value}" -le "${number}" ]; then
+        runtimewarning "Free space at ${path} under ${minSize}.";
+    fi;
+
+}
+#}}}
+
+# function declare_parameters()#{{{
+function declare_parameters() {
+
+    if [[ -z "${DEBUG_PRMS}" ]]; then return; fi;
+
+    local pName;
+    echo "==[DEBUG]=======";
+    for pName in $@; do
+        eval local pValue="\${${pName}}"
+        echo "  * ${pName}: \"${pValue}\"";
+    done;
+    echo "================";
+
+};
+#}}}
+
+# function getFreePort() - Get first available port number for new cluster. #{{{
+function getFreePort() {
+    local basePort="${1}";
+    local lastPort=$(
+        (echo $(( ${basePort} - 1 )) ; pg_lsclusters -h) \
+        | tr -s ' ' \
+        | cut -f 3 -d ' ' \
+        | sort -nr \
+        | grep "^${basePort:0:1}" \
+        | head -n 1
+    ) 
+    echo $(( ${lastPort:-${basePort} - 1} + 1 ));
+}
+#}}}
+
+# function warn_masterSetup()#{{{
+function warn_masterSetup() {
+    echo ""
+    echo "Please, DOUBLE CHECK master setup:"
+    echo "----------------------------------"
+    echo ""
+    echo "  * Both, master and standby PostgreSQL server is of the same version."
+    echo ""
+    echo "  * Check that '${REPLICATION_USER}' user was propperly created on master:"
+    echo "      $ sudo -u postgres createuser ${REPLICATION_USER} -P -c 5 --replication"
+    echo ""
+    echo "  * Check connectivity to master PostgreSQL port."
+    echo ""
+    echo "  * Check that '${REPLICATION_USER}' user at least has REPLICATION access"
+    echo "    in master's pg_hba.conf."
+    echo "    - Access to the 'postgres' database is recommended too due to enable 'list'"
+    echo "      subcommand to check replication slot status."
+    echo "    - Example:"
+    echo "     | # TYPE  DATABASE              USER         ADDRESS          METHOD |"
+    echo "     |   host  replication,postgres  ${REPLICATION_USER}  <standby_ip>/32  md5    |"
+    echo ""
+    echo "  * Check postgresql.conf of the master server:"
+    echo "    - wal_level = hot_standby  # (or so...)"
+    echo "    - max_wal_senders = 5  # (or so...)"
+    echo "    - max_replication_slots = 1  # (at least as much as standbys you need to attach...)"
+    echo ""
+    echo "  * If you changed any of below settings, reload or restart service in master as needed."
+    echo ""
+    read -p "Press ENTER if you are ready to continue or CTRL+C to cancel..."
+}
+#}}}
+
+# function sFetch()#{{{
+function sFetch() {
+# USAGE: sFetch <localPath> <remoteServer> <remoteFile1> [remoteFile2 ...]
+
+local localPath=$1; shift;
+local remoteServer=$1; shift;
+local startBanner="#####:: SYSTEM MESSAGE START ::#####"
+local endBanner="#####:: SYSTEM MESSAGE END ::#####"
+local remoteUser;
+local remotePass;
+local remoteUrl;
+
+echo ""
+echo "______________________________________________________________________________________________"
+echo "INFO: We are going to fetch MASTER server configuration files..."
+echo "    To do that we need a username and passord with SUDO privileges in the MASTER server."
+echo "    Now, you will be asked for them..."
+echo "NOTE: This password will be asked twice because ssh always asks it by itself but we need it"
+echo "    too to be able to copy needed files thoug sudo."
+echo "______________________________________________________________________________________________"
+
+read -p "MASTER sudoed user name: " remoteUser
+read -s -p "MASTER sudoed user password: " remotePass
+echo ""
+echo "______________________________________________________________________________________________"
+echo ""
+remoteUrl="${remoteUser}@${remoteServer}";
+echo "Starting fetching process..."
+echo ""
+echo "Connecting to MASTER. Remember that user's password will be asked again just now.";
+echo ""
+
+
+function pick() {
+
+    while (( "$#" )); do
+        local remoteFile="${1}";
+        local localFile="${localPath}/$(basename ${remoteFile})";
+        echo "echo cat \> " "\"${localFile}\"" "\<\<!FEOF${#}";
+        echo "echo \"${remotePass}\" | 2>/dev/null sudo -S cat \"${remoteFile}\";";
+        echo "echo !FEOF${#}";
+        echo "";
+        shift;
+    done
+};
+
+
+(
+echo "${startBanner}";
+ssh "${remoteUrl}" <<!EOF
+echo "${endBanner}"
+$(pick ${@});
+!EOF
+) \
+    | sed "/${startBanner}/,/${endBanner}/d" \
+    | bash
+
+
+echo "______________________________________________________________________________________________"
+echo "INFO: Config files sucessfully fetched.";
+echo "______________________________________________________________________________________________"
+
+
+}
+#}}}
+
+# function mergeFile()#{{{
+function mergeFile() {
+    
+    local oldFile="${1}";
+    local newFile="${2}";
+    local mergedFile="${3}";
+    local acceptOld=${4};
+    local acceptNew=${5};
+
+    local fName=$(basename "${mergedFile}");
+
+    function fixFile() {
+        echo "Failed to automatically merge ${fName}"
+        read -p "Press ENTER to edit and manually fix conflicts or CTRL+C to cancel..."
+        vim "${mergedFile}";
+    };
+
+    humandiff -i \
+        -o "${acceptOld}" \
+        -n "${acceptNew}" \
+        "${oldFile}" \
+        "${newFile}" \
+        "Proposed / Default (Standby)" \
+        "Master" \
+    > "${mergedFile}";
+
+    local exitCode=$?;
+    if [ $exitCode -eq 1 ]; then
+        fixFile;
+        exitCode=$?;
+    fi;
+    if [ $exitCode -ne 0 ]; then
+        runtimeerror "Failed to merge ${fName} file."
+    fi;
+
+}
+#}}}
+
+# function mergePostgresqlConf()#{{{
+function mergePostgresqlConf() {
+    
+    local oldFile="${1}";
+    local newFile="${2}";
+    local mergedFile="${3}";
+
+    # Proposed Standby
+    local acceptOld=$(
+        echo "
+            data_directory
+            hba_file
+            ident_file
+            external_pid_file
+            port
+            shared_buffers
+            cluster_name
+            stats_temp_directory
+            archive_command
+            log_line_prefix
+            include_dir
+            dynamic_library_path
+            bgwriter_flush_after
+        " \
+        | xargs \
+        | sed 's/ /,/g' \
+    );
+
+    # Master
+    local acceptNew=$(
+        echo "
+            ssl
+            wal_level
+            max_wal_senders
+            wal_writer_flush_after
+            max_wal_size
+            checkpoint_flush_after
+            archive_mode
+            listen_addresses
+            max_connections
+            log_timezone
+            datestyle
+            timezone
+            lc_messages
+            lc_monetary
+            lc_numeric
+            lc_time
+            temp_buffers
+            work_mem
+            search_path
+            maintenance_work_mem
+            max_worker_processes
+            max_parallel_workers_per_gather
+            default_text_search_config
+        " \
+        | xargs \
+        | sed 's/ /,/g' \
+    );
+
+    mergeFile \
+        "${oldFile}" \
+        "${newFile}" \
+        "${mergedFile}" \
+        "${acceptOld}" \
+        "${acceptNew}" \
+    ;
+
+
+}
+#}}}
+
+# function mergePghbaConf()#{{{
+function mergePghbaConf() {
+    
+    local oldFile="${1}";
+    local newFile="${2}";
+    local mergedFile="${3}";
+
+    local acceptOld=$(
+        echo "
+            replication
+        " \
+        | xargs \
+        | sed 's/ /,/g' \
+    );
+
+    local acceptNew=$(
+        echo "
+            bar
+        " \
+        | xargs \
+        | sed 's/ /,/g' \
+    );
+
+
+
+    mergeFile \
+        "${oldFile}" \
+        "${newFile}" \
+        "${mergedFile}" \
+        "${acceptOld}" \
+        "${acceptNew}" \
+    ;
+
+}
+#}}}
+
+# function configureHotStandby()#{{{
+function configureHotStandby() {
+local configFile="${1}";
+local hbaFile="${2}";
+
+# TODO: Add max_replication_slots = 1
+#       ...when future humandiff versions deal it correctly even in different
+#       position.
+
+cat >> "${configFile}" <<!HSconfigEOF
+
+###########################################
+# Hot-Standby configuration section       #
+# --------------------------------------- #
+
+# Allow read queries during recovery:
+# (Hot Standby mode)
+hot_standby = on
+
+###########################################
+
+!HSconfigEOF
+
+
+cat >> "${hbaFile}" <<!HShbaEOF
+
+###########################################
+# Hot-Standby configuration section       #
+# --------------------------------------- #
+
+# Allow local replication to user postgres:
+# OPTIONAL. But useful to locally clone database:
+
+local   replication     postgres                       peer
+
+###########################################
+
+!HShbaEOF
+
+
+};
+#}}}
+
+# function config_setup()#{{{
+function config_setup() {
+
+    local localCfgPath="${1}"
+    local remoteCfgPath="${2}";
+
+    local templatesPath="${localCfgPath}/multistandby";
+
+    local masterConfPath="${templatesPath}/postgresql.master.conf";
+    local masterHbaPath="${templatesPath}/pg_hba.master.conf";
+    local baseConfPath="${templatesPath}/postgresql.base.conf";
+    local baseHbaPath="${templatesPath}/pg_hba.base.conf";
+
+    local realConfPath="${localCfgPath}/postgresql.conf";
+    local realHbaPath="${localCfgPath}/pg_hba.conf";
+
+    # Fetch files:
+    mkdir "${templatesPath}";
+    sFetch \
+        "${templatesPath}" \
+        "${master_host}" \
+        "${remoteCfgPath}/postgresql.conf" \
+        "${remoteCfgPath}/pg_hba.conf"\
+    ;
+
+    # Move things:
+    mv "${templatesPath}/postgresql.conf" "${masterConfPath}";
+    mv "${templatesPath}/pg_hba.conf" "${masterHbaPath}";
+    mv "${realConfPath}" "${baseConfPath}";
+    mv "${realHbaPath}" "${baseHbaPath}";
+
+    # Configure things:
+    configureHotStandby "${baseConfPath}" "${baseHbaPath}";
+
+    # Merge things:
+    mergePostgresqlConf "${baseConfPath}" "${masterConfPath}" "${realConfPath}";
+    mergePghbaConf "${baseHbaPath}" "${masterHbaPath}" "${realHbaPath}";
+
+}
+#}}}
+
+# function slot_status(pg_host pg_port pg_user pg_pass)#{{{
+function slot_status() {
+    local sl_name="${1}";
+    local pg_host="${2}";
+    local pg_port="${3}";
+    local pg_user="${4}";
+    local pg_pass="${5}";
+    local sl_status;
+
+    local SQL_slot_status="
+        select case restart_lsn is null when true then 'new' else active::text end
+        from pg_replication_slots
+        where slot_name = '${sl_name}'
+    ";
+
+    if [[ -n "${pg_pass}" ]]; then
+        sl_status=$( \
+            PGPASSWORD="${pg_pass}" psql \
+                --no-password \
+                -c "${SQL_slot_status}" \
+                -h "${pg_host}" \
+                -p "${pg_port}" \
+                -U "${pg_user}" \
+                -d "postgres" \
+                -t \
+                2> /dev/null \
+        );
+        if [[ $? -ne 0 ]]; then
+            sl_status="error";
+        fi;
+        sl_status="${sl_status## }"; # ltrim
+        sl_status="${sl_status%% }"; # rtrim
+
+        case "${sl_status}" in
+            "new")
+                sl_status="UNUSED";
+            ;;
+            "true")
+                sl_status="ONLINE";
+            ;;
+            "false")
+                sl_status="OFFLINE";
+            ;;
+            "error")
+                sl_status="conErr";
+            ;;
+            *)
+                sl_status="-NONE-";
+            ;;
+        esac;
+    else
+        sl_status="pwErr";
+    fi;
+
+    echo "${sl_status}";
+
+}
+#}}}
+
+# function checkBackupDirs()#{{{
+function checkBackupDirs() {
+
+    local isBaseBackup=${1};
+
+    checkArg dirExists pg_backupPath "Backup target";
+
+    # Check that "base" and "wal" directories does exist.
+    # If not, then baybe backup media is not properly mounted... 
+    if [ \
+        ! -d "${pg_backupPath}/base" \
+        -o ! -d "${pg_backupPath}/wal" \
+    ]; then
+        echo "";
+        runtimewarning "Backup media not detected!!";
+
+        echo "  -> Check that backup media is REALLY mounted under ${pg_backupPath}."
+        echo "  -> If it is Ok, then 'base' and 'wal' directories will be created."
+
+
+        if [ "${isBaseBackup}" = true ]; then
+            echo ""
+            echo "${B}IMPORTANT NOTE:${b} This probably also means that no wal archiving"
+            echo "is being done for ANY cluster so ${B}PITR recovery wouldn't be possible.${b}";
+        fi;
+
+        raiseStatus $warningStatus;
+        echo ""
+        askConfirm "Would you want to create 'base' and 'wal' directories in backup media?";
+
+        # Create it if not cancelled.
+        sudo -u postgres mkdir \
+            "${pg_backupPath}/base" \
+            "${pg_backupPath}/wal" \
+        ;
+        chmod go-rwx \
+            "${pg_backupPath}/base" \
+            "${pg_backupPath}/wal" \
+        ;
+
+        # Check again:
+        if [ \
+            ! -d "${pg_backupPath}/base" \
+            -o ! -d "${pg_backupPath}/wal" \
+        ]; then
+            runtimeerror "Failed to create 'base' and 'wal' directories!!";
+        fi;
+
+    fi;
+}
+#}}}
+
+# function fmtTime ()#{{{
+function fmtTime () {
+
+    # Tried to implement own 'time' command implementation.
+    #  --> Bash native is too verbose and doesn't support formatting
+    #  --> GNU version:
+    #    * Can be reached thought $(which time).
+    #    * But can't measure internal bash functions.
+    # No luck yet. -> Preserving this formatting function for manual measuring.
+
+    # Borrowed from https://stackoverflow.com/a/12199816/4243912
+    num=$1
+    min=0
+    hour=0
+    day=0
+    if((num>59));then
+        ((sec=num%60))
+        ((num=num/60))
+        if((num>59));then
+            ((min=num%60))
+            ((num=num/60))
+            if((num>23));then
+                ((hour=num%24))
+                ((day=num/24))
+            else
+                ((hour=num))
+            fi
+        else
+            ((min=num))
+        fi
+    else
+        ((sec=num))
+    fi
+
+    [[ "${1}" -lt 86400 ]] || echo -n "${day}d "
+    [[ "${1}" -lt 3600 ]] || echo -n "${hour}h "
+    [[ "${1}" -lt 60 ]] || echo -n "${min}m "
+    echo "${sec}s"
+}
+#}}}
+
+# =================#}}}
+
+
+# Commands:#{{{
+# =========
+
+# function cmd_list() // List existing clusters. #{{{
+function cmd_list() {
+
+    local message="${1}";
+    local cmd="${2}";
+
+    local IFS=$'\n';
+    local isHeader="true";
+    local remote_slot;
+    local local_slot;
+    local shownCount=0;
+    local hiddenCount=0;
+
+    # function read_remote_slot()#{{{
+    function read_remote_slot() {
+        remote_slot=$(slot_status \
+            "${replica_slotName}" \
+            "${pg_masterhost}" \
+            "${pg_masterport}" \
+            "${REPLICATION_USER}" \
+            "${pg_replicationpw}" \
+        );
+    };
+    #}}}
+
+    # function read_local_slot()#{{{
+    function read_local_slot() {
+        local_slot=$(slot_status \
+            "${backup_slotName}" \
+            "localhost" \
+            "${pg_localport}" \
+            "${REPLICATION_USER}" \
+            "${pg_replicationpw}" \
+        );
+    }
+    #}}}
+
+    for r in $(pg_lsclusters); do
+        local output=$(echo "${r}" | perl -pe 's/(^\S+\s+\S+\s+\S+\s+\S+).*/$1/')
+        if [[ -n "${isHeader}" ]]; then
+            isHeader="";
+            local baseWidth=${#output};
+            local rslotpos=$(( $baseWidth + 9 ));
+            local lslotpos=$(( $baseWidth + 18 ));
+
+            output=`printf "%-${rslotpos}s %s" $output`
+            local header="${output}Standby  Backup";
+
+            if [[ -n "${message}" ]]; then
+                echo "";
+                echo "${B}${message}${b}";
+                echo "";
+            fi;
+
+            echo "${header}" | paint green
+            echo ${header//?/-}- | paint green
+
+            continue;
+        fi;
+
+        # Data from pg_lsclusters:
+        # ------------------------
+        local pg_version=$(echo $r | awk '{print $1}');
+        local pg_masterhost=$(echo $r | awk '{print $2}');
+        local pg_localport=$(echo $r | awk '{print $3}');
+        local pg_status=$(echo $r | awk '{print $4}');
+        local pg_owner=$(echo $r | awk '{print $5}');
+        local pg_local_clusterPath=$(echo $r | awk '{print $6}');
+        local pg_logfile=$(echo $r | awk '{print $7}');
+        local is_replica=true;
+        local is_failovered=false;
+        local errMsg="";
+
+
+        # Filter against required version:
+        if [ \
+            -n "${list_pg_version}" \
+            -a "${pg_version}" != "${list_pg_version}" \
+        ]; then
+            continue;
+        fi;
+
+        # Filter against required cluster name:
+        if [ \
+            -n "${list_clusterName}" \
+            -a "${pg_masterhost}" != "${list_clusterName}" \
+        ]; then
+            continue;
+        fi;
+
+        # Check standby operation mode:
+        if [ -e "${pg_local_clusterPath}/${pg_recoveryFailedFile}" ]; then
+            errMsg=$(2>&1 head -n 1 "${pg_local_clusterPath}/${pg_recoveryFailedFile}");
+        elif [ ! -e "${pg_local_clusterPath}/${pg_recoveryConfFile}" ]; then
+            if [ ! -e "${pg_local_clusterPath}/${pg_recoveryDoneFile}" ]; then
+                # Not (even in failover or failed state) standby.
+                if [ "${list_mode}" != "all" ]; then
+                    hiddenCount=$((hiddenCount+1));
+                    # Count only if not shown.
+                    continue;
+                fi;
+                is_replica=false;
+            else
+                # Only recovery.done
+                is_failovered=true;
+            fi;
+        fi;
+
+        shownCount=$((shownCount+1))
+
+
+        if [ "${is_replica}" = true ]; then
+
+            # Data from recovery.conf:
+            # ------------------------
+            local pg_replicationpw=$( \
+                cat "${pg_local_clusterPath}/${pg_recoveryConfFile}" "${pg_local_clusterPath}/${pg_recoveryDoneFile}" \
+                  2>/dev/null \
+                  | perl -ne "s/^primary_conninfo\s*=.*?user=${REPLICATION_USER} password=(\S+).*\$/\$1/ && print" \
+                  | head -n 1 \
+            );
+            local pg_masterport=$( \
+                cat "${pg_local_clusterPath}/${pg_recoveryConfFile}" "${pg_local_clusterPath}/${pg_recoveryDoneFile}" \
+                  2>/dev/null \
+                  | perl -ne "s/^primary_conninfo\s*=.*?user=${REPLICATION_USER} .*?port=(\d+).*\$/\$1/ && print" \
+                  | head -n 1 \
+            );
+            # Empty pg_masterport flags failover
+
+            # Data from master database:
+            # --------------------------
+            read_remote_slot;
+            read_local_slot;
+
+        else
+            local_slot="----";
+            remote_slot="----";
+
+        fi
+
+        # Row output
+        # ----------
+        if [[ -n "${errMsg}" ]]; then
+            output="${output} - ${errMsg}";
+        else
+            if [ "${is_failovered}" = true ]; then
+                output="${output},FAILOVER"
+                if [ "${remote_slot}" = "OFFLINE" ]; then
+                    remote_slot="${B}!DEAD!${b}"
+                fi;
+                if [ "${remote_slot}" = "ONLINE" ]; then
+                    remote_slot="${B}!Stolen!${b}"
+                fi;
+            fi;
+            output=`printf "%-${rslotpos}s %s" $output`
+            output=`printf "%-${lslotpos}s %s" "${output}${remote_slot}"`
+            output="${output}${local_slot}";
+        fi;
+
+        if [[ -n "${cmd}" ]]; then # cmd provided
+            echo "${B}${output}${b}";
+            indent ${cmd};
+        else # Regular listing operation
+            echo "${output}";
+        fi;
+
+    done;
+
+    labelmessage lightcyan "TOTAL" "${shownCount}";
+    if [ "${hiddenCount}" -gt 0 ]; then
+        raiseStatus $warningStatus;
+        runtimewarning "There exists ${hiddenCount} non replication databases too.";
+    fi;
+
+    # Silently check minimal free space:
+    checkFreeSpace "${pg_basePath}" "${minClusterFreeSpace}";
+
+}
+#}}}
+
+# function cmd_add()#{{{
+function cmd_add() {
+
+    warn_masterSetup;
+
+    declare_parameters \
+        pg_version \
+        master_host \
+        master_port \
+        local_pg_port \
+        pg_local_cfgPath \
+        pg_remote_cfgPath \
+        pg_local_clusterPath \
+    ;
+
+    local errFlagFile="${pg_local_clusterPath}/${pg_recoveryFailedFile}";
+
+
+    # Create cluster:
+    displayMessage "Creating new ${pg_version} local cluster..."
+    ( \
+        pg_createcluster --port "${local_pg_port}" "${pg_version}" "${master_host}" \
+            || runtimeerror "Failed to create new cluster"
+    ) \
+    && echo "Created ${clone_name} cluster at ${clone_pg_port} port."
+
+    # Erase contents:
+    echo "Erasing cluster contents..."
+    sudo rm -rf "${pg_local_clusterPath}" \
+        || runtimeerror "Failed to erase cluster contents" "${errFlagFile}" \
+    ;
+
+    sudo mkdir "${pg_local_clusterPath}"
+    sudo chown postgres:postgres "${pg_local_clusterPath}"
+    sudo chmod 700 "${pg_local_clusterPath}"
+
+
+    displayMessage "Configure Standby";
+
+    config_setup "${pg_local_cfgPath}" "${pg_remote_cfgPath}"
+
+
+    displayMessage "Creating slot into Master";
+
+    $(pg_babel pg_receivewal) \
+        --create-slot \
+        --if-not-exists \
+        -S "${replica_slotName}" \
+        -h "${master_host}" \
+        -p ${master_port} \
+        -U "${REPLICATION_USER}" \
+    || runtimeerror "Failed to create ${replica_slotname} slot on master." "${errFlagFile}" \
+    ;
+
+
+    displayMessage "Fetching Base Backup from Master";
+
+    echo ""
+    echo "Trying to connect PostgreSQL master on ${master_host}:${master_port}"
+    echo "as ${REPLICATION_USER} to retrieve base backup."
+    echo "It may delay a bit. Later ${REPLICATION_USER} user password will be required..."
+    echo ""
+    sudo -u postgres $(pg_babel pg_basebackup) \
+        -h "${master_host}" \
+        -p ${master_port} \
+        -U "${REPLICATION_USER}" \
+        -S "$replica_slotName" \
+        -D "${pg_local_clusterPath}" \
+        -P \
+        $(pg_babel --wal-method)=stream \
+        -R \
+    ||  runtimeerror "Failed to retrieve base backup from master." "${errFlagFile}" \
+    ;
+
+
+    displayMessage "Starting Up..."
+    echo "Please wait..."
+
+    log_timestamp=$(date +"%Y-%m-%d %H:%M:%S %Z");
+    if ( \
+        pg_ctlcluster "${pg_version}" "${master_host}" start \
+    ); then
+        displayMessage "DONE!!"
+        echo "${log_timestamp} STANDBY: Standby Replication succesfully started." >> ${pg_logFile}
+    else
+        displayMessage "ERROR!!"
+        echo "${log_timestamp} STANDBY: Failed to start Standby Replication." >> ${pg_logFile}
+    fi;
+
+    cmd_list;
+
+}
+#}}}
+
+# function cmd_drop()#{{{
+function cmd_drop() {
+
+    declare_parameters \
+        pg_version \
+        clusterName \
+        master_port \
+        pg_local_clusterPath \
+        pg_local_cfgPath \
+    ;
+
+
+
+    ### Slot detection DRAFT
+    ### ====================
+    # local recoveryFilePath="${pg_local_clusterPath}/${pg_recoveryConfFile}";
+    # local slotSpec="primary_slot_name = '${replica_slotName}'";
+    # # Drop slot if it is detected
+    # # (So this command can be used to drop clonations too).
+    # >/dev/null 2>&1 \
+    #     grep "${slotSpec}" "${recoveryFilePath}" \
+    # && (
+    # )
+
+
+    displayMessage "Dropping Cluster ${pg_version} ${clusterName}";
+
+    pg_dropcluster "${pg_version}" "${clusterName}" --stop \
+    || runtimewarning "Failed to drop ${pg_version} ${clusterName} cluster." \
+    ;
+
+
+    # Drop slot from master.
+    displayMessage "Dropping slot on Master";
+
+    echo "You will be asked for master's "${REPLICATION_USER}" user password."
+
+    $(pg_babel pg_receivewal) \
+        --drop-slot \
+        -S "$replica_slotName" \
+        -h "${clusterName}" \
+        -p ${master_port} \
+        -U "${REPLICATION_USER}" \
+    || runtimewarning "Failed to drop ${replica_slotname} slot on master." \
+    ;
+
+
+    # Erase configuration:
+    displayMessage "Erasing replica configuration..."
+    sudo rm -rf "${pg_local_cfgPath}" \
+        || runtimeerror "Failed to erase cluster config" \
+    ;
+
+
+};
+#}}}
+
+# function cmd_failover()#{{{
+function cmd_failover() {
+
+    declare_parameters \
+        pg_version \
+        master_host \
+        master_port \
+    ;
+
+    askConfirm "Failover is a NON REVERSIBLE operation";
+
+    displayMessage "Promoting ${master_host}...";
+
+    pg_ctlcluster "${pg_version}" "${master_host}" promote
+
+    # Drop slot from master.
+    displayMessage "Trying to drop slot on Master in old master (if reachable)";
+
+    runtimewarning "This operation would NORMALLY fail if old master is no more available."
+
+    echo "Otherwise you will be asked for master's "${REPLICATION_USER}" user password."
+
+    $(pg_babel pg_receivewal) \
+        --drop-slot \
+        -S "$replica_slotName" \
+        -h "${master_host}" \
+        -p ${master_port} \
+        -U "${REPLICATION_USER}" \
+    || runtimewarning "Failed to drop ${replica_slotname} slot on master." \
+    ;
+
+    echo "";
+
+    cmd_list;
+
+};
+#}}}
+
+# function cmdClone()#{{{
+function cmdClone() {
+
+    declare_parameters \
+        pg_version \
+        master_host \
+        master_user \
+        master_port \
+        clone_name \
+        clone_pg_port \
+    ;
+
+    local pg_clonePath="${pg_basePath}/${pg_version}/${clone_name}"
+    local recoveryFilePath="${pg_clonePath}/${pg_recoveryConfFile}";
+    local master_host_arg="";
+    local master_user_arg="";
+
+    if [[ -n "${master_host}" ]]; then
+        master_host_arg=" -h ${master_host}";
+    fi;
+
+    if [[ -n "${master_user}" ]]; then
+        master_user_arg=" -U ${master_user}";
+    fi;
+
+    # Create cluster:
+    displayMessage "Creating new ${pg_version} local cluster..."
+    ( \
+        pg_createcluster --port "${clone_pg_port}" "${pg_version}" "${clone_name}" \
+            || runtimeerror "Failed to create new cluster"
+    ) \
+    && echo "Created ${clone_name} cluster at ${clone_pg_port} port."
+
+    # Erase contents:
+    echo "Erasing cluster contents..."
+    sudo rm -rf "${pg_clonePath}" \
+        || runtimeerror "Failed to erase cluster contents"
+
+    sudo mkdir "${pg_clonePath}"
+    sudo chown postgres:postgres "${pg_clonePath}"
+    sudo chmod 700 "${pg_clonePath}"
+
+
+    displayMessage "Cloning from ${master_host}:${master_port}...";
+
+    echo ""
+    echo "Trying to connect PostgreSQL master on ${master_host}:${master_port}"
+    echo "as ${REPLICATION_USER} to retrieve base backup."
+    echo "It may delay a bit. Later ${REPLICATION_USER} user password will be required..."
+    echo ""
+
+
+    sudo -u postgres $(pg_babel pg_basebackup) ${master_host_arg} ${master_user_arg} \
+        -p "${master_port}" \
+        -D "${pg_clonePath}" \
+        -P \
+        $(pg_babel --wal-method)=stream \
+    || runtimeerror "Failed to clone master." \
+    ;
+
+
+    # Remove recovery file (if cloned from replica).
+    rm "${recoveryFilePath}" 2>/dev/null;
+
+    displayMessage "Starting Up..."
+    echo "Please wait..."
+
+    pg_ctlcluster "${pg_version}" "${clone_name}" start
+
+    displayMessage "DONE!!"
+
+    cmd_list;
+
+}
+#}}}
+
+#function cmd_viconf()#{{{
+function cmd_viconf() {
+editor "${pg_local_cfgPath}/postgresql.conf";
+}
+#}}}
+
+#function cmd_vihba()#{{{
+function cmd_vihba() {
+    editor "${pg_local_cfgPath}/pg_hba.conf";
+}
+#}}}
+
+#function cmd_start()#{{{
+function cmd_start() {
+    pg_ctlcluster "${pg_version}" "${clusterName}" start
+}
+#}}}
+
+#function cmd_stop()#{{{
+function cmd_stop() {
+    pg_ctlcluster "${pg_version}" "${clusterName}" stop
+}
+#}}}
+
+#function cmd_reload()#{{{
+function cmd_reload() {
+    pg_ctlcluster "${pg_version}" "${clusterName}" reload
+}
+#}}}
+
+#function cmd_restart()#{{{
+function cmd_restart() {
+    pg_ctlcluster "${pg_version}" "${clusterName}" restart
+}
+#}}}
+
+#function cmd_status()#{{{
+function cmd_status() {
+    if [[ -z "${list_pg_version}" ]]; then
+        pg_lsclusters
+    elif [[ -z "${list_clusterName}" ]]; then
+        pg_lsclusters "${list_pg_version}"
+    else 
+        pg_lsclusters "${list_pg_version}" "${list_clusterName}"
+    fi;
+}
+#}}}
+
+#function cmdCheck()#{{{
+function cmdCheck() {
+
+    local cmdMessage="${1}";
+
+    # function standbyCheck()#{{{
+    function standbyCheck() {
+
+        if ! [[ "${pg_status}" =~ ^online ]]; then
+            runtimewarning "- Cluster is not online..."
+        fi;
+        if ! [[ "${pg_status}" =~ ,recovery$ ]]; then
+            runtimeerror --noexit "- Cluster is not in recovery mode..."
+        fi;
+
+        if [ "${remote_slot}" == "conErr" ]; then
+            runtimewarning "- Replication slot (Standby) status cannot be checked..."
+        elif [ "${remote_slot}" != "ONLINE" ]; then
+            runtimewarning "- Replication slot (Standby) is not ONLINE..."
+        fi;
+
+        if [ "${local_slot}" == "conErr" ]; then
+            runtimewarning "- Wal archiving slot (Backup) status cannot be checked..."
+        elif [ "${local_slot}" != "ONLINE" ]; then
+            runtimewarning "- Wal archiving slot (Backup) is not ONLINE..."
+        fi;
+    }
+    #}}}
+
+    cmd_list \
+        "${cmdMessage}" \
+        standbyCheck \
+    ;
+
+};
+#}}}
+
+# function cmdBackup()#{{{
+function cmdBackup() {
+
+    # function streamBackup()#{{{
+    function streamBackup() {
+
+        local errMsg="";
+
+        # Build destination path
+        local exportFileName="${masterHostname}_${startTime}";
+        local exportPath="${pg_baseDir}/${exportFileName}_base.tar.${ext_compression}";
+
+        # Perform base backup:
+        echo "- Packing and streaming... " | paint cyan
+        local startTime=$(date +%s);
+        sudo -u postgres $(pg_babel pg_basebackup) \
+            -F tar \
+            -p "${pg_localport}" \
+            -D "-" \
+            -P \
+        | ${cmd_compression} > "${exportPath}" \
+        || errMsg="Failed to backup master." \
+        ;
+        local endTime=$(date +%s);
+        local elapsed=$(($endTime - $startTime));
+        local humanTime=$(fmtTime $elapsed);
+        labelmessage blue "Elapsed" "${humanTime}";
+
+        # Set permissions:
+        if [ "${errMsg}" = "" ]; then
+            chmod go-rwx "${exportPath}" \
+                || errMsg="Failed to set export permissions." \
+            ;
+        fi;
+
+        # Final status message:
+        if [ "${errMsg}" = "" ]; then
+            labelmessage green "DONE" $( \
+                ls -oh "${exportPath}" | perl -pe 's/^(.*?\s+){3}//' \
+            );
+        else
+            raiseStatus $errorStatus;
+            runtimeerror --noexit "${errMsg}";
+        fi;
+
+    }
+    #}}}
+
+    # function legacyBackup()#{{{
+    function legacyBackup() {
+
+        local errMsg="";
+
+        # Build destination path
+        local exportFileName="${masterHostname}_${startTime}";
+        local exportPath="${pg_baseDir}/${exportFileName}_legacy.tar.${ext_compression}";
+        local targetDirName="${exportFileName}_TMPBKP";
+        local targetPath="${tempPath}/${targetDirName}";
+
+        # Create temporary directory:
+        sudo -u postgres mkdir -p "${targetPath}" \
+            || errMsg="Failed to create temporary directory." \
+        ;
+
+        # Define and program cleanup callback:
+        function cleanup() {
+            # Set error message:
+            errMsg="Interrupt signal detected.";
+            # Remove temporary data:
+            rm -rf "${targetPath}" 2>&1 >/dev/null
+            # Remove temp dir too but only if empty:
+            rmdir "${tempPath}" 2>&1 >/dev/null
+        }
+        trap 'cleanup' SIGHUP SIGINT SIGTERM
+
+        # Export:
+        if [ "${errMsg}" = "" ]; then
+            echo "- Exporting to temporary directory... " | paint cyan
+            local startTime=$(date +%s);
+            sudo -u postgres $(pg_babel pg_basebackup) \
+                -F tar \
+                -p "${pg_localport}" \
+                -D "${targetPath}" \
+                -P \
+            || errMsg="Failed to export database." \
+            ;
+            local endTime=$(date +%s);
+            local elapsed=$(($endTime - $startTime));
+            local humanTime=$(fmtTime $elapsed);
+            labelmessage blue "Elapsed" "${humanTime}";
+        fi;
+
+        # Perform extra minimal free space check:
+        # (Legacy backups occupies data disk so may cause free space issues)
+        checkFreeSpace "${tempPath}" "${minClusterFreeSpace}";
+
+        # Pack
+        if [ "${errMsg}" = "" ]; then
+            echo "- Packing and compressing... " | paint cyan
+            local startTime=$(date +%s);
+            pushd "${tempPath}" >/dev/null;
+            tar c ${targetDirName} \
+                | ${cmd_compression} > "${exportPath}" \
+                || errMsg="Failed to pack and compress export." \
+            ;
+            popd >/dev/null;
+            local endTime=$(date +%s);
+            local elapsed=$(($endTime - $startTime));
+            local humanTime=$(fmtTime $elapsed);
+            labelmessage blue "Elapsed" "${humanTime}";
+        fi;
+
+        # Set permissions:
+        if [ "${errMsg}" = "" ]; then
+            chmod go-rwx "${exportPath}" \
+                || errMsg="Failed to set export permissions." \
+            ;
+        fi;
+
+        # Cleanup:
+        trap - SIGHUP SIGINT SIGTERM
+        echo "- Cleaning up... "
+        cleanup;
+
+        # Final status message:
+        if [ "${errMsg}" = "" ]; then
+            labelmessage green "DONE" $( \
+                ls -oh "${exportPath}" | perl -pe 's/^(.*?\s+){3}//' \
+            );
+        else
+            raiseStatus $errorStatus;
+            runtimewarning " ${errMsg}";
+        fi;
+    }
+    #}}}
+
+    # function clusterBackup()#{{{
+    function clusterBackup() {
+
+        local pg_baseDir="${pg_backupPath}/base/${pg_version}/${pg_masterhost}";
+
+        local hasTablespaces=false;
+        [[ $(ls "${pg_local_clusterPath}/pg_tblspc" | wc -l) -eq 0 ]] || hasTablespaces=true;
+
+        local masterHostname=$(echo -n "${pg_masterhost}" | perl -pe 's/\..*//')
+        local startTime=$(date +"%Y%m%d-%H%M%S");
+
+
+        # Ensure directory creation:
+        2>/dev/null sudo -u postgres mkdir -p "${pg_baseDir}";
+        2>/dev/null sudo chmod 700 "${pg_baseDir}"
+
+        # Check backup slot status:
+        [[ "${local_slot}" == "ONLINE" ]] \
+            || runtimewarning "Wrong Wal-Streaming status: ${local_slot}." \
+        ;
+
+        echo "- Starting backup process..." | paint cyan
+
+        if [ "${hasTablespaces}" = true ]; then
+
+            # Warn legacy backup:
+            runtimewarning --nostatus "Database with tablespaces: Failing to LEGACY Backup."
+            labelmessage ligthcyan "INFO" "Legacy backup should be MANUALLY restored!!!";
+
+            legacyBackup;
+        else
+            streamBackup;
+        fi;
+
+    }
+    #}}}
+
+    checkBackupDirs true;
+
+    cmd_list \
+        "Performing Base Backups..." \
+        clusterBackup \
+    ;
+
+}
+#}}}
+
+# function cmdStream()#{{{
+function cmdStream() {
+
+    # function streamWal()#{{{
+    function streamWal() {
+
+        local pg_walDir="${pg_backupPath}/wal/${pg_version}/${pg_masterhost}";
+
+        # function startWal() #{{{
+        function startWal() {
+            local pg_port="${1}";
+
+            # Temporary redirect stderr
+            # This avoids kill event to be logged in original terminal.
+            exec 3>&2
+            exec 2> /dev/null
+
+            # Launch wal receiver:
+            (
+                sudo -u postgres $(pg_babel pg_receivewal) \
+                    -p ${pg_port} \
+                    -S ${backup_slotName} \
+                    -D "${pg_walDir}"
+            ) &
+            # IMPORTANT: -p SHOULD be first option.
+            #            (it will be used to detect process in stopWal() function)
+
+            exec 2>&3
+
+            disown $!;
+
+        }
+        #}}}
+
+        # function stopWal()#{{{
+        function stopWal() {
+            local pg_port="${1}";
+            local output="Ok"
+            local pid=$(
+                ps axh -o pid,args \
+                    | grep -E "^ *[[:digit:]]+ +$(pg_babel pg_receivewal) -p ${pg_port} -S ${backup_slotName}" \
+                    | awk '{print $1}' \
+            );
+            [[ "${pid}" -gt 0 ]] || output="ERROR";
+            kill "${pid}" 2>&1 > /dev/null;
+            sleep 1; # Give time to stop.
+            local alive=$(ps h "${pid}" | wc -l);
+            [[ "${alive}" -eq 0 ]] || output="FAILED";
+            if [ "${output,,}" = "ok" ]; then
+                echo -n "${output}" | paint lightgreen;
+                echo "";
+            else
+                echo -n "${output}" | paint lightred;
+                echo "";
+            fi;
+        };
+        #}}}
+
+        if [[ "${cmdOper}" == "start" ]]; then # Start operation
+
+            # On-demand slot creation:#{{{
+            if [[ "${local_slot}" = "-NONE-" ]]; then
+                echo -n "- Creating backup streaming slot... "
+                sudo -u postgres $(pg_babel pg_receivewal) \
+                    --create-slot \
+                    --if-not-exists \
+                    -S "${backup_slotName}" \
+                    -p ${pg_localport} \
+                    2> /dev/null \
+                ;
+
+                if [[ $? -ne 0 ]]; then
+                    raiseStatus $errorStatus;
+                    echo "${B}ERROR!!${b}"
+                else
+                    echo "Ok."
+                    local_slot='UNUSED';
+                fi;
+
+            fi;
+            #}}}
+
+            if [ \
+                "${local_slot}" = "UNUSED" \
+                -o "${local_slot}" = "OFFLINE" \
+            ]; then
+                echo -n "- Starting streaming replication... "
+
+                # Ensure directory creation:
+                2>/dev/null sudo -u postgres mkdir -p "${pg_walDir}";
+                2>/dev/null sudo chmod 700 "${pg_walDir}"
+
+                startWal "${pg_localport}";
+                sleep 1; # Give time to start.
+                read_local_slot;
+
+                if [ "${local_slot}" = "ONLINE" ]; then
+                    echo "Ok" | paint lightgreen;
+                else
+                    raiseStatus $errorStatus;
+                    echo "${B}FAILED!!${b}" | paint ligthred;
+
+                fi;
+
+                local pos=$(( ${lslotpos} - 4 ));
+                local newStatusRow=`printf "%-${pos}s %s" "- New status:"`
+                newStatusRow="${newStatusRow}${local_slot}";
+                echo "${newStatusRow}";
+
+            elif [ "${local_slot}" = "ONLINE" ]; then
+                runtimewarning "Streaming replication already running..."
+            else
+                raiseStatus $errorStatus;
+                runtimeerror --noexit "Streaming replication can't be started..."
+            fi;
+        elif [[ "${cmdOper}" == "stop" ]]; then # Stop operation
+            if [[ "${local_slot}" = "ONLINE" ]]; then
+                echo -n "- Stopping streaming replication... "
+                stopWal "${pg_localport}";
+            else
+                raiseStatus $warningStatus;
+                runtimewarning "Streaming replication already stopped!!"
+            fi;
+        elif [[ "${cmdOper}" == "check" ]]; then # Stop operation
+            if [ "${local_slot}" = "ONLINE" ]; then
+                echo -n "- Streaming replication running... "
+                echo -n "(Ok)" | paint lightgreen;
+                echo "";
+            else
+                runtimeerror --noexit "Streaming replication is not runnig..."
+            fi;
+        fi;
+    }
+    #}}}
+
+    local cmdOper="${1,,}";
+    local cmdMessage="${2}";
+
+    checkBackupDirs;
+
+    cmd_list \
+        "${cmdMessage}" \
+        streamWal \
+    ;
+
+    # Daemonize
+    # (Make generated jobs to not be affected by parent signals)
+    disown -a;
+
+}
+#}}}
+
+# function cmdConfigBackup()#{{{
+function cmdConfigBackup() {
+
+    checkBackupDirs;
+    local destPath="${pg_backupPath}/etc";
+    sudo -u postgres mkdir -p "${destPath}";
+    chmod go-rwx \
+        "${destPath}" \
+    ;
+
+    local startTime=$(date +"%Y%m%d-%H%M%S");
+    local fileName="pgEtc_${startTime}.tar.${ext_compression}"
+
+    echo "Performing configuration files backup."
+    pushd "${pg_configPath}" >/dev/null;
+
+    tar c * \
+        | ${cmd_compression} \
+        | sudo -u postgres tee "${destPath}/${fileName}" > /dev/null \
+    ;
+    popd >/dev/null;
+
+    echo "${B}DONE!${b}";
+}
+#}}}
+
+
+
+# # function cmdRestore()
+# function cmdRestore() {
+#
+#     declare_parameters \
+#         pg_version \
+#         master_host \
+#         master_user \
+#         master_port \
+#         clone_name \
+#         clone_pg_port \
+#     ;
+#
+#     local pg_clonePath="${pg_basePath}/${pg_version}/${clone_name}"
+#     local recoveryFilePath="${pg_clonePath}/${pg_recoveryConfFile}";
+#     local master_host_arg="";
+#     local master_user_arg="";
+#
+#     if [[ -n "${master_host}" ]]; then
+#         master_host_arg=" -h ${master_host}";
+#     fi;
+#
+#     if [[ -n "${master_user}" ]]; then
+#         master_user_arg=" -U ${master_user}";
+#     fi;
+#
+#     # Create cluster:
+#     displayMessage "Creating new ${pg_version} local cluster..."
+#     ( \
+#         pg_createcluster --port "${clone_pg_port}" "${pg_version}" "${clone_name}" \
+#             || runtimeerror "Failed to create new cluster"
+#     ) \
+#     && echo "Created ${clone_name} cluster at ${clone_pg_port} port."
+#
+#     # Erase contents:
+#     echo "Erasing cluster contents..."
+#     sudo rm -rf "${pg_clonePath}" \
+#         || runtimeerror "Failed to erase cluster contents"
+#
+#     sudo mkdir "${pg_clonePath}"
+#     sudo chown postgres:postgres "${pg_clonePath}"
+#     sudo chmod 700 "${pg_clonePath}"
+#
+#
+#     displayMessage "Cloning from ${master_host}:${master_port}...";
+#
+#     echo ""
+#     echo "Trying to connect PostgreSQL master on ${master_host}:${master_port}"
+#     echo "as ${REPLICATION_USER} to retrieve base backup."
+#     echo "It may delay a bit. Later ${REPLICATION_USER} user password will be required..."
+#     echo ""
+#
+#
+#     sudo -u postgres $(pg_babel pg_basebackup) ${master_host_arg} ${master_user_arg} \
+#         -p "${master_port}" \
+#         -D "${pg_clonePath}" \
+#         -P \
+#         $(pg_babel --wal-method)=stream \
+#     || runtimeerror "Failed to clone master." \
+#     ;
+#
+#
+#     # Remove recovery file (if cloned from replica).
+#     rm "${recoveryFilePath}" 2>/dev/null;
+#
+#     displayMessage "Starting Up..."
+#     echo "Please wait..."
+#
+#     pg_ctlcluster "${pg_version}" "${clone_name}" start
+#
+#     displayMessage "DONE!!"
+#
+#     cmd_list;
+#
+# }
+
+
+
+# =========#}}}
+
+
+# Main#{{{
+# ====
+
+cmd="${1}";shift;
+
+case "${cmd}" in
+    "list")#{{{
+
+        # Positional parameters:
+        # ----------------------
+        list_mode="${1}";
+        if [ \
+            "${list_mode}" = "standby" \
+            -o "${list_mode}" = "all" \
+            -o "${list_mode}" = "legacy" \
+        ]; then
+            shift;
+        else # default
+            list_mode="standby";
+        fi;
+        list_pg_version="${1}"; shift;
+        list_clusterName="${1}"; shift;
+        [ "${list_pg_version}" = "" ] || checkArg pgVersion "list_pg_version" soft;
+        [ "${list_clustername}" = "" ] || checkArg clusterName "list_clusterName"
+
+        # Command run:
+        # ------------
+        checkRoot;
+        banner;
+        if [ "${list_mode}" == "legacy" ]; then
+            cmd_status;
+        else
+            cmd_list;
+        fi;
+
+    ;;#}}}
+    "add")#{{{
+
+        # Positional parameters:
+        # ----------------------
+        pg_version="${1}"; shift;
+        master_host="${1}"; shift;
+        master_port=${1:-5432}; shift;
+        checkArg pgVersion "pg_version";
+        checkArg fqdnhost "master_host"
+        checkArg pgPort "master_port"
+
+        # Calculated parameters:
+        # ----------------------
+        local_pg_port="$(getFreePort "${STANDBY_BASE_PORT}")";
+        pg_local_clusterPath="${pg_basePath}/${pg_version}/${master_host}"
+        pg_local_cfgPath="${pg_configPath}/${pg_version}/${master_host}"
+        pg_remote_cfgPath="${pg_configPath}/${pg_version}/main"
+        pg_logFile="${pg_logPath}/postgresql-${pg_version}-${master_host}.log"
+
+        # Command run:
+        # ------------
+        checkRoot;
+        banner;
+        cmd_add;
+
+    ;;#}}}
+    "drop")#{{{
+
+        # Positional parameters:
+        # ----------------------
+        pg_version="${1}"; shift;
+        clusterName="${1}"; shift;
+        master_port=${1:-5432}; shift;
+        checkArg pgVersion "pg_version" soft;
+        checkArg clusterName "clusterName"
+        checkArg pgPort "master_port"
+
+        # Calculated parameters:
+        # ----------------------
+        pg_local_clusterPath="${pg_basePath}/${pg_version}/${clusterName}"
+        pg_local_cfgPath="${pg_configPath}/${pg_version}/${clusterName}"
+
+        # Command run:
+        # ------------
+        checkRoot;
+        askConfirm "You are going to remove Hot Standby for ${pg_version} ${clusterName}";
+        banner;
+
+        cmd_drop;
+
+    ;;#}}}
+    "viconf"|"vihba"|"start"|"stop"|"reload"|"restart") #{{{
+
+        # Positional parameters:
+        # ----------------------
+        pg_version="${1}"; shift;
+        clusterName="${1}"; shift;
+        if [[ "${cmd}" != "status" ]]; then # Make optional for status check.
+            checkArg pgVersion "pg_version" soft;
+            checkArg clusterName "clusterName"
+        fi;
+
+        # Calculated parameters:
+        # ----------------------
+        pg_local_cfgPath="${pg_configPath}/${pg_version}/${clusterName}"
+
+        # Command run:
+        # ------------
+        if [[ "${cmd}" != "status" ]]; then
+            checkRoot;
+        fi;
+
+        banner;
+        "cmd_${cmd}";
+
+    ;;#}}}
+    "log")#{{{
+
+        # Positional parameters:
+        # ----------------------
+        pg_version="${1}"; shift;
+        clusterName="${1}"; shift;
+        checkArg pgVersion "pg_version" soft;
+        checkArg clusterName "clusterName"
+
+        # Calculated parameters:
+        # ----------------------
+        pg_logFile="${pg_logPath}/postgresql-${pg_version}-${clusterName}.log"
+
+        # Command run:
+        # ------------
+        checkRoot;
+        less +F "${pg_logFile}";
+
+    ;;#}}}
+    "failover") #{{{
+
+        # Positional parameters:
+        # ----------------------
+        pg_version="${1}"; shift;
+        master_host="${1}"; shift;
+        master_port=${1:-5432}; shift;
+        checkArg pgVersion "pg_version";
+        checkArg fqdnhost "master_host"
+        checkArg pgPort "master_port"
+
+        # Command run:
+        # ------------
+        checkRoot;
+        banner;
+
+        cmd_failover;
+
+    ;;#}}}
+    "clone")#{{{
+
+        # Positional parameters:
+        # ----------------------
+
+        pg_version="${1}"; shift;
+
+        # clone_name:
+        if [[ -n "${1}" ]] && ! [[ "${1}" =~ ^[0-9]*$ ]] ; then # Non numeric parameter
+            clone_name="${1}"; shift;  # New cluster name.
+        else # Numeric or no more parameters.
+            clone_name="main" # Default to "main".
+        fi;
+
+        # clone_pg_port:
+        if [[ "${1}" =~ ^[0-9]+$ ]] ; then # Numeric parameter
+            clone_pg_port="${1}"; shift;
+        else # Numeric or no more parameters.
+            clone_pg_port="$(getFreePort "${REGULAR_BASE_PORT}")";
+        fi;
+
+        # master_host:
+        if [[ -n "${1}" ]] && ! [[ "${1}" =~ ^[0-9]*$ ]] ; then # Non numeric parameter
+            master_host="${1}"; shift; # Remote host.
+        else
+            master_host=""; # Default local unix socket.
+        fi
+
+        # master_port:
+        master_port=${1:-5432}; shift;
+
+        # TODO: Make interactive (no parameters -> Dialog selection).
+
+        checkArg pgVersion "pg_version" soft;
+        checkArg pgPort "master_port"
+
+
+        # Calculated parameters:
+        # ----------------------
+        if [[ -n "${master_host}" ]]; then
+            # User replication user in remote connections.
+            master_user="${REPLICATION_USER}";
+        else
+            # Use postgres user with peer auth in unix socket connections.
+            master_user="";
+        fi;
+
+
+        # Command run:
+        # ------------
+        checkRoot;
+        banner;
+
+        warn_masterSetup;
+
+        cmdClone;
+
+    ;;#}}}
+    "check")#{{{
+
+        # Command run:
+        # ------------
+        checkRoot;
+        banner;
+        cmdCheck "${operation}" "Checking Standby status";
+
+    ;;#}}}
+    "backup")#{{{
+
+        if [ "${1}" == "config" ]; then
+
+            # Command run:
+            # ------------
+            checkRoot;
+            banner;
+            cmdConfigBackup;
+
+        else
+
+            # Positional parameters:
+            # ----------------------
+            list_pg_version="${1}"; shift;
+            list_clusterName="${1}"; shift;
+            [ "${list_pg_version}" = "" ] || checkArg pgVersion "list_pg_version" soft;
+            [ "${list_clustername}" = "" ] || checkArg clusterName "list_clusterName"
+
+            # Calculated parameters:
+            # ----------------------
+            pg_local_cfgPath="${pg_configPath}/${pg_version}/${clusterName}"
+
+            # Command run:
+            # ------------
+            checkRoot;
+            banner;
+            cmdBackup;
+
+        fi;
+
+    ;;#}}}
+    "stream")#{{{
+
+        # Positional parameters:
+        # ----------------------
+        operation="${1}";
+        if [ \
+            "${operation}" = "start" \
+            -o "${operation}" = "stop" \
+            -o "${operation}" = "check" \
+        ]; then
+            shift;
+        else # default
+            operation="check";
+        fi;
+        # Calculated parameters:
+        # ----------------------
+        if [ "${operation}" = "start" ]; then
+            opMessage="Starting/Resuming Streaming replication"
+        fi;
+        if [ "${operation}" = "stop" ]; then
+            opMessage="Stopping Streaming replication"
+        fi;
+        if [ "${operation}" = "check" ]; then
+            opMessage="Checking Streaming replication status"
+        fi;
+
+        # Command run:
+        # ------------
+        checkRoot;
+        banner;
+        cmdStream "${operation}" "${opMessage}";
+
+    ;;#}}}
+    "restore")
+        runtimeerror 'Unimplemented!!!';
+    ;;
+
+    "help")#{{{
+        help "${1}";
+    ;;#}}}
+    *)#{{{
+        usageerror "Unknown command: ${cmd}";
+    ;;#}}}
+esac;
+
+# ====#}}}
+
+
+exit $exitStatus;
+
